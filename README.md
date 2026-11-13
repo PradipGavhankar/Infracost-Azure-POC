@@ -253,4 +253,5 @@ report carefully, and apply only in the non-production subscription.
 | Terraform says the saved plan is stale | Stop, create a new plan, review the new cost report, and request approval again. |
 #   I n f r a c o s t - A z u r e - P O C  
  #   I n f r a c o s t - A z u r e - P O C  
+ #   I n f r a c o s t - A z u r e - P O C  
  
