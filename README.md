@@ -252,4 +252,5 @@ report carefully, and apply only in the non-production subscription.
 | Cost policy cannot read the report | Inspect the JSON produced by the pinned Infracost version; update the parser deliberately rather than weakening the fail-closed check. |
 | Terraform says the saved plan is stale | Stop, create a new plan, review the new cost report, and request approval again. |
 #   I n f r a c o s t - A z u r e - P O C  
+ #   I n f r a c o s t - A z u r e - P O C  
  
