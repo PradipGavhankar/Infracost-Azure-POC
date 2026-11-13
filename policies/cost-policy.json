@@ -1,0 +1,5 @@
+{
+  "currency": "USD",
+  "max_monthly_cost": 500,
+  "description": "POC maximum estimated monthly infrastructure cost. Set an approved value."
+}

@@ -1,0 +1,297 @@
+# Azure DevOps pipeline: Terraform + Infracost
+# Seven-stage flow: Init -> Fmt -> Validate -> Plan -> Cost -> Approval -> Apply
+# Replace the example service connection/backend/environment values before use.
+# IMPORTANT: use a protected main branch and Azure DevOps Environment checks.
+
+trigger:
+  branches:
+    include: [main]
+
+# PR validation is deliberately separate: it must not access production state
+# or production credentials. See README.md for the recommended PR pipeline.
+pr: none
+
+lockBehavior: sequential
+
+variables:
+  - name: terraformVersion
+    value: '1.17.2'
+  - name: infracostVersion
+    value: '0.10.49'
+  - name: terraformRoot
+    value: 'infra'
+  - name: azureServiceConnection
+    value: 'REPLACE_WITH_AZURE_WIF_SERVICE_CONNECTION'
+  - name: backendResourceGroup
+    value: 'REPLACE_WITH_TFSTATE_RESOURCE_GROUP'
+  - name: backendStorageAccount
+    value: 'REPLACE_WITH_TFSTATE_STORAGE_ACCOUNT'
+  - name: backendContainer
+    value: 'tfstate'
+  - name: backendKey
+    value: 'landing-zone/prod.tfstate'
+  - name: productionEnvironment
+    value: 'terraform-production'
+  - name: planArtifact
+    value: 'terraform-plan'
+  - name: costArtifact
+    value: 'infracost-report'
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+# ---------------------------------------------------------------------------
+# 01 - INIT: verify toolchain and initialize remote backend using OIDC.
+# Each stage is isolated, so later stages must initialize Terraform again.
+# ---------------------------------------------------------------------------
+- stage: Terraform_Init
+  displayName: '01 - Terraform Init'
+  jobs:
+  - job: Init
+    steps:
+    - checkout: self
+      clean: true
+    - bash: |
+        set -euo pipefail
+        ./scripts/install-tools.sh "$(terraformVersion)" "$(infracostVersion)"
+        terraform version
+        infracost --version
+      displayName: 'Install pinned Terraform and Infracost versions'
+    - task: AzureCLI@2
+      displayName: 'Initialize AzureRM remote backend with OIDC'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -euo pipefail
+          export ARM_USE_OIDC=true
+          export ARM_USE_AZUREAD=true
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          cd "$(terraformRoot)"
+          terraform init -input=false -lockfile=readonly \
+            -backend-config="resource_group_name=$(backendResourceGroup)" \
+            -backend-config="storage_account_name=$(backendStorageAccount)" \
+            -backend-config="container_name=$(backendContainer)" \
+            -backend-config="key=$(backendKey)" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+# ---------------------------------------------------------------------------
+# 02 - FMT: formatting check only; does not mutate repository files.
+# ---------------------------------------------------------------------------
+- stage: Terraform_Fmt
+  displayName: '02 - Terraform Fmt'
+  dependsOn: Terraform_Init
+  condition: succeeded()
+  jobs:
+  - job: Fmt
+    steps:
+    - checkout: self
+    - bash: |
+        set -euo pipefail
+        ./scripts/install-tools.sh "$(terraformVersion)" "$(infracostVersion)"
+        terraform -chdir="$(terraformRoot)" fmt -check -recursive -diff
+      displayName: 'Check Terraform formatting'
+
+# ---------------------------------------------------------------------------
+# 03 - VALIDATE: backend-free init avoids touching production state.
+# Checkov/TFLint are optional add-ons; configure their pinned versions in
+# install-tools.sh before enabling them as mandatory enterprise gates.
+# ---------------------------------------------------------------------------
+- stage: Terraform_Validate
+  displayName: '03 - Terraform Validate and IaC Security'
+  dependsOn: Terraform_Fmt
+  condition: succeeded()
+  jobs:
+  - job: Validate
+    steps:
+    - checkout: self
+    - bash: |
+        set -euo pipefail
+        ./scripts/install-tools.sh "$(terraformVersion)" "$(infracostVersion)"
+        terraform -chdir="$(terraformRoot)" init -backend=false -input=false -lockfile=readonly
+        terraform -chdir="$(terraformRoot)" validate -no-color
+        # Add pinned Checkov/TFLint execution here after organization approval.
+      displayName: 'Validate Terraform configuration'
+
+# ---------------------------------------------------------------------------
+# 04 - PLAN: authenticated plan, JSON export, and restricted artifact.
+# Plan and JSON files can contain sensitive values: restrict artifact access.
+# ---------------------------------------------------------------------------
+- stage: Terraform_Plan
+  displayName: '04 - Terraform Plan'
+  dependsOn: Terraform_Validate
+  condition: succeeded()
+  jobs:
+  - job: Plan
+    steps:
+    - checkout: self
+      clean: true
+    - bash: |
+        set -euo pipefail
+        ./scripts/install-tools.sh "$(terraformVersion)" "$(infracostVersion)"
+      displayName: 'Install pinned tools'
+    - task: AzureCLI@2
+      displayName: 'Create saved Terraform plan'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -euo pipefail
+          export ARM_USE_OIDC=true
+          export ARM_USE_AZUREAD=true
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          cd "$(terraformRoot)"
+          terraform init -input=false -lockfile=readonly \
+            -backend-config="resource_group_name=$(backendResourceGroup)" \
+            -backend-config="storage_account_name=$(backendStorageAccount)" \
+            -backend-config="container_name=$(backendContainer)" \
+            -backend-config="key=$(backendKey)" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+          terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan
+          terraform show -json tfplan > tfplan.json
+          mkdir -p "$(Build.ArtifactStagingDirectory)/plan"
+          cp tfplan tfplan.json "$(Build.ArtifactStagingDirectory)/plan/"
+          sha256sum "$(Build.ArtifactStagingDirectory)/plan/tfplan" \
+            > "$(Build.ArtifactStagingDirectory)/plan/tfplan.sha256"
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish restricted plan artifact'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/plan'
+        artifact: '$(planArtifact)'
+        publishLocation: pipeline
+
+# ---------------------------------------------------------------------------
+# 05 - COST: estimate from the exact plan JSON; publish machine-readable and
+# human-readable reports. This sample uses Infracost CLI v0.10.x commands.
+# Cost policy gate is intentionally configured as a maximum monthly cost.
+# For PR delta comparisons, add a trusted main-branch baseline workflow.
+# ---------------------------------------------------------------------------
+- stage: Infrastructure_Cost
+  displayName: '05 - Infracost Cost Analysis'
+  dependsOn: Terraform_Plan
+  condition: succeeded()
+  jobs:
+  - job: Cost
+    steps:
+    - checkout: self
+    - bash: |
+        set -euo pipefail
+        ./scripts/install-tools.sh "$(terraformVersion)" "$(infracostVersion)"
+      displayName: 'Install pinned tools'
+    - download: current
+      artifact: '$(planArtifact)'
+    - bash: |
+        set -euo pipefail
+        PLAN_DIR="$(Pipeline.Workspace)/$(planArtifact)"
+        OUT="$(Build.ArtifactStagingDirectory)/cost"
+        mkdir -p "$OUT"
+        test -s "$PLAN_DIR/tfplan.json"
+        echo "Generating Infracost estimate from saved Terraform plan JSON..."
+        infracost breakdown \
+          --path "$PLAN_DIR/tfplan.json" \
+          --format json \
+          --out-file "$OUT/infracost.json"
+        infracost output \
+          --path "$OUT/infracost.json" \
+          --format table | tee "$OUT/infracost-table.txt"
+        # Keep API key out of command-line arguments and logs.
+        python3 scripts/cost-policy.py \
+          --input "$OUT/infracost.json" \
+          --policy policies/cost-policy.json
+      displayName: 'Calculate cost and enforce policy'
+      env:
+        INFRACOST_API_KEY: $(INFRACOST_API_KEY)
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Infracost reports'
+      condition: always()
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/cost'
+        artifact: '$(costArtifact)'
+        publishLocation: pipeline
+
+# ---------------------------------------------------------------------------
+# 06 - APPROVAL: server-side manual validation. Reject on timeout.
+# Use Environment approvals/checks as the stronger independent protection.
+# ---------------------------------------------------------------------------
+- stage: Manual_Approval
+  displayName: '06 - Cost and Infrastructure Approval'
+  dependsOn: Infrastructure_Cost
+  condition: succeeded()
+  jobs:
+  - job: Approval
+    pool: server
+    timeoutInMinutes: 1440
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: 'REPLACE_WITH_APPROVER_GROUP_OR_EMAIL'
+        instructions: |
+          Review the Terraform plan and Infracost report artifacts.
+          Confirm create/update/delete actions, monthly estimated cost,
+          security impact, tags, budget and approved change record.
+          Reject if the cost policy or change request is not acceptable.
+        onTimeout: reject
+
+# ---------------------------------------------------------------------------
+# 07 - APPLY: only main; protected environment; re-init same backend and
+# apply the exact saved plan. Terraform rejects a stale plan; never re-plan
+# automatically after approval.
+# ---------------------------------------------------------------------------
+- stage: Terraform_Apply
+  displayName: '07 - Terraform Apply'
+  dependsOn: Manual_Approval
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  lockBehavior: sequential
+  jobs:
+  - deployment: ApplyProduction
+    displayName: 'Apply approved production plan'
+    environment: '$(productionEnvironment)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+          - bash: |
+              set -euo pipefail
+              ./scripts/install-tools.sh "$(terraformVersion)" "$(infracostVersion)"
+            displayName: 'Install pinned tools'
+          - download: current
+            artifact: '$(planArtifact)'
+          - task: AzureCLI@2
+            displayName: 'Apply exact saved Terraform plan'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_USE_OIDC=true
+                export ARM_USE_AZUREAD=true
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                cd "$(terraformRoot)"
+                terraform init -input=false -lockfile=readonly \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=$(backendKey)" \
+                  -backend-config="use_oidc=true" \
+                  -backend-config="use_azuread_auth=true"
+                PLAN="$(Pipeline.Workspace)/$(planArtifact)/tfplan"
+                (cd "$(Pipeline.Workspace)/$(planArtifact)" && sha256sum -c tfplan.sha256)
+                terraform apply -input=false -lock-timeout=5m -no-color "$PLAN"
